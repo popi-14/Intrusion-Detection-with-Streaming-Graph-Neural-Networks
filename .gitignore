@@ -1,9 +1,13 @@
 # Datasets and generated model files
 *.parquet
+*.csv
 *.pt
 *.pth
 *.ckpt
 DataSet/
+.env
+.env.*
+!.env.example
 
 # Local Python and test artifacts
 __pycache__/

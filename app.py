@@ -1,4 +1,4 @@
-"""Flask dashboard for replaying and evaluating the NF-UNSW-NB15-V2 dataset."""
+"""Flask dashboard for streaming multi-class intrusion detection."""
 
 from __future__ import annotations
 
@@ -18,8 +18,7 @@ app = Flask(__name__)
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 
-CATEGORIES = ("Anomaly", "Normal Traffic")
-DATASET_PATH = os.environ.get("DATASET_PATH", "/data/NF-UNSW-NB15-V2.parquet")
+DATASET_PATH = os.environ.get("DATASET_PATH", "/data")
 TRAINING_FRACTION = float(os.environ.get("TRAINING_FRACTION", "0.8"))
 REPLAY_BATCH_SIZE = max(1, int(os.environ.get("REPLAY_BATCH_SIZE", "128")))
 REPLAY_INTERVAL_SECONDS = max(
@@ -37,9 +36,9 @@ state: dict[str, Any] = {
     "model_progress": 0.0,
     "model_error": None,
     "training_rows": 0,
-    "training_anomalies": 0,
-    "calibration_rows": 0,
-    "threshold": 0.5,
+    "categories": [],
+    "training_class_counts": {},
+    "available_categories": [],
     "replay_rows": 0,
     "replay_total": 0,
     "total_events": 0,
@@ -47,14 +46,46 @@ state: dict[str, Any] = {
     "nodes": set(),
     "edge_count": 0,
     "graph_seed_nodes": [],
-    "counts": Counter({category: 0 for category in CATEGORIES}),
+    "counts": Counter(),
     "events": deque(maxlen=100),
     "node_risk": {},
-    "true_positives": 0,
-    "true_negatives": 0,
-    "false_positives": 0,
-    "false_negatives": 0,
+    "confusion_matrix": {},
 }
+
+
+def _evaluation_snapshot() -> dict[str, Any]:
+    categories = state["categories"]
+    matrix = state["confusion_matrix"]
+    total = sum(sum(matrix[actual].values()) for actual in categories)
+    correct = sum(matrix[category][category] for category in categories)
+    by_class: dict[str, dict[str, float | int]] = {}
+    for category in categories:
+        true_positive = matrix[category][category]
+        support = sum(matrix[category].values())
+        predicted = sum(matrix[actual][category] for actual in categories)
+        precision = true_positive / predicted if predicted else 0.0
+        recall = true_positive / support if support else 0.0
+        f1 = (
+            2 * precision * recall / (precision + recall)
+            if precision + recall
+            else 0.0
+        )
+        by_class[category] = {
+            "precision": round(precision, 4),
+            "recall": round(recall, 4),
+            "f1": round(f1, 4),
+            "support": support,
+        }
+    return {
+        "total": total,
+        "correct": correct,
+        "accuracy": round(correct / total, 4) if total else 0.0,
+        "by_class": by_class,
+        "confusion_matrix": {
+            actual: {predicted: matrix[actual][predicted] for predicted in categories}
+            for actual in categories
+        },
+    }
 
 
 def _snapshot_locked() -> dict[str, Any]:
@@ -71,6 +102,7 @@ def _snapshot_locked() -> dict[str, Any]:
             "source": event["source"],
             "target": event["destination"],
             "score": event["score"],
+            "category": event["category"],
             "alert": event["status"] == "ALERT",
         }
         for event in events[:45]
@@ -78,23 +110,18 @@ def _snapshot_locked() -> dict[str, Any]:
     return {
         "version": state["version"],
         "paused": state["paused"],
+        "categories": list(state["categories"]),
         "model": {
             "name": "Temporal GraphSAGE",
             "status": state["model_status"],
             "progress": round(state["model_progress"], 3),
             "error": state["model_error"],
             "training_rows": state["training_rows"],
-            "training_anomalies": state["training_anomalies"],
-            "calibration_rows": state["calibration_rows"],
-            "threshold": state["threshold"],
+            "training_class_counts": state["training_class_counts"],
+            "available_categories": state["available_categories"],
             "replay_rows": state["replay_rows"],
             "replay_total": state["replay_total"],
-            "evaluation": {
-                "true_positives": state["true_positives"],
-                "true_negatives": state["true_negatives"],
-                "false_positives": state["false_positives"],
-                "false_negatives": state["false_negatives"],
-            },
+            "evaluation": _evaluation_snapshot(),
         },
         "metrics": {
             "nodes": len(state["nodes"]),
@@ -102,7 +129,9 @@ def _snapshot_locked() -> dict[str, Any]:
             "alerts": state["alert_count"],
             "flows": state["total_events"],
         },
-        "counts": {category: state["counts"][category] for category in CATEGORIES},
+        "counts": {
+            category: state["counts"][category] for category in state["categories"]
+        },
         "events": events,
         "graph": {"nodes": graph_nodes, "edges": graph_edges},
         "series": [
@@ -122,31 +151,27 @@ def _set_progress(processed: int, total: int) -> None:
 
 def _publish_batch(batch: list[dict[str, Any]]) -> None:
     with condition:
+        matrix = state["confusion_matrix"]
         for event in batch:
-            is_alert = event["status"] == "ALERT"
-            is_actual_anomaly = event["label"] == 1
+            category = event["category"]
+            actual_category = event["true_attack"]
+            is_alert = category != "Normal"
             state["total_events"] += 1
             state["replay_rows"] += 1
-            state["counts"][event["category"]] += 1
-            if is_alert:
-                state["alert_count"] += 1
-            if is_alert and is_actual_anomaly:
-                state["true_positives"] += 1
-            elif is_alert:
-                state["false_positives"] += 1
-            elif is_actual_anomaly:
-                state["false_negatives"] += 1
-            else:
-                state["true_negatives"] += 1
+            state["counts"][category] += 1
+            state["alert_count"] += int(is_alert)
+            matrix[actual_category][category] += 1
             state["nodes"].update((event["source"], event["destination"]))
             if event["new_edge"]:
                 state["edge_count"] += 1
-            state["node_risk"][event["source"]] = max(
-                state["node_risk"].get(event["source"], 0.0), event["score"]
-            )
-            state["node_risk"][event["destination"]] = max(
-                state["node_risk"].get(event["destination"], 0.0), event["score"]
-            )
+            if is_alert:
+                risk = event["score"]
+                state["node_risk"][event["source"]] = max(
+                    state["node_risk"].get(event["source"], 0.0), risk
+                )
+                state["node_risk"][event["destination"]] = max(
+                    state["node_risk"].get(event["destination"], 0.0), risk
+                )
             event["received_at"] = datetime.now(timezone.utc).isoformat(
                 timespec="seconds"
             )
@@ -169,9 +194,16 @@ def _stream_worker() -> None:
         detector = model
         with condition:
             state["training_rows"] = summary["training_rows"]
-            state["training_anomalies"] = summary["training_anomalies"]
-            state["calibration_rows"] = summary["calibration_rows"]
-            state["threshold"] = summary["threshold"]
+            state["categories"] = summary["categories"]
+            state["training_class_counts"] = summary["training_class_counts"]
+            state["available_categories"] = summary["available_categories"]
+            state["counts"] = Counter({category: 0 for category in summary["categories"]})
+            state["confusion_matrix"] = {
+                actual: Counter(
+                    {predicted: 0 for predicted in summary["categories"]}
+                )
+                for actual in summary["categories"]
+            }
             state["replay_total"] = summary["replay_rows"]
             state["nodes"].update(model.active_nodes())
             state["edge_count"] = summary["edges"]

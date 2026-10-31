@@ -7,7 +7,7 @@ services:
     environment:
       PYTHONUNBUFFERED: "1"
       PORT: "5000"
-      DATASET_PATH: /data/NF-UNSW-NB15-V2.parquet
+      DATASET_PATH: /data
       TRAINING_FRACTION: "0.8"
       REPLAY_BATCH_SIZE: "128"
       REPLAY_INTERVAL_SECONDS: "0.25"
