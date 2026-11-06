@@ -1,8 +1,7 @@
-# Flask API and Parquet data access
-Flask>=3.0,<4.0
-gunicorn>=22.0,<24.0
-duckdb>=1.2,<2.0
-numpy>=2.0,<3.0
-# Multi-class GraphSAGE model (CPU-only PyTorch wheel)
+# Pinned runtime dependencies; PyG/pandas are intentionally not required.
+Flask==3.1.1
+duckdb==1.3.2
+numpy==2.2.6
+# CPU-only PyTorch; avoids platform-specific PyG extension wheels.
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.7.1+cpu

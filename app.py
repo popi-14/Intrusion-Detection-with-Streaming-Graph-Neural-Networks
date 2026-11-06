@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 from collections import Counter, deque
 from datetime import datetime, timezone
+from time import perf_counter
 from typing import Any
 
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
@@ -24,6 +26,7 @@ REPLAY_BATCH_SIZE = max(1, int(os.environ.get("REPLAY_BATCH_SIZE", "128")))
 REPLAY_INTERVAL_SECONDS = max(
     0.01, float(os.environ.get("REPLAY_INTERVAL_SECONDS", "0.25"))
 )
+ROC_BINS = 100
 
 condition = threading.Condition(threading.RLock())
 worker_guard = threading.Lock()
@@ -41,6 +44,7 @@ state: dict[str, Any] = {
     "available_categories": [],
     "replay_rows": 0,
     "replay_total": 0,
+    "replay_interval_seconds": REPLAY_INTERVAL_SECONDS,
     "total_events": 0,
     "alert_count": 0,
     "nodes": set(),
@@ -50,6 +54,8 @@ state: dict[str, Any] = {
     "events": deque(maxlen=100),
     "node_risk": {},
     "confusion_matrix": {},
+    "roc_histogram": {},
+    "performance_samples": deque(maxlen=30),
 }
 
 
@@ -76,14 +82,83 @@ def _evaluation_snapshot() -> dict[str, Any]:
             "f1": round(f1, 4),
             "support": support,
         }
+    roc_points: list[list[tuple[float, float]]] = []
+    class_auc: dict[str, float] = {}
+    for category in categories:
+        histogram = state["roc_histogram"].get(category)
+        if histogram is None:
+            continue
+        positives = histogram["positive"]
+        negatives = histogram["negative"]
+        positive_total = sum(positives)
+        negative_total = sum(negatives)
+        if not positive_total or not negative_total:
+            continue
+        true_positive = false_positive = 0
+        points = [(0.0, 0.0)]
+        for index in range(ROC_BINS - 1, -1, -1):
+            true_positive += positives[index]
+            false_positive += negatives[index]
+            points.append(
+                (
+                    false_positive / negative_total,
+                    true_positive / positive_total,
+                )
+            )
+        area = sum(
+            (x2 - x1) * (y1 + y2) / 2
+            for (x1, y1), (x2, y2) in zip(points, points[1:])
+        )
+        class_auc[category] = round(area, 4)
+        roc_points.append(points)
+
+    def interpolate(points: list[tuple[float, float]], fpr: float) -> float:
+        previous_fpr, previous_tpr = points[0]
+        for current_fpr, current_tpr in points[1:]:
+            if fpr <= current_fpr:
+                if current_fpr == previous_fpr:
+                    return current_tpr
+                ratio = (fpr - previous_fpr) / (current_fpr - previous_fpr)
+                return previous_tpr + ratio * (current_tpr - previous_tpr)
+            previous_fpr, previous_tpr = current_fpr, current_tpr
+        return 1.0
+
+    macro_curve = []
+    if roc_points:
+        for index in range(21):
+            false_positive_rate = index / 20
+            true_positive_rate = sum(
+                interpolate(points, false_positive_rate) for points in roc_points
+            ) / len(roc_points)
+            macro_curve.append(
+                {
+                    "fpr": round(false_positive_rate, 4),
+                    "tpr": round(true_positive_rate, 4),
+                }
+            )
+    performance_samples = list(state["performance_samples"])
+    processed = sum(count for count, _ in performance_samples)
+    elapsed = sum(duration for _, duration in performance_samples)
     return {
         "total": total,
         "correct": correct,
         "accuracy": round(correct / total, 4) if total else 0.0,
         "by_class": by_class,
+        "roc_auc_ovr_macro": (
+            round(sum(class_auc.values()) / len(class_auc), 4) if class_auc else None
+        ),
+        "roc_auc_by_class": class_auc,
+        "roc_curve": macro_curve,
         "confusion_matrix": {
             actual: {predicted: matrix[actual][predicted] for predicted in categories}
             for actual in categories
+        },
+        "performance": {
+            "throughput_fps": round(processed / elapsed, 2) if elapsed else 0.0,
+            "latency_ms_per_flow": (
+                round(elapsed * 1000 / processed, 3) if processed else 0.0
+            ),
+            "window_batches": len(performance_samples),
         },
     }
 
@@ -112,7 +187,7 @@ def _snapshot_locked() -> dict[str, Any]:
         "paused": state["paused"],
         "categories": list(state["categories"]),
         "model": {
-            "name": "Temporal GraphSAGE",
+            "name": "GraphSAGE with replay context",
             "status": state["model_status"],
             "progress": round(state["model_progress"], 3),
             "error": state["model_error"],
@@ -121,6 +196,7 @@ def _snapshot_locked() -> dict[str, Any]:
             "available_categories": state["available_categories"],
             "replay_rows": state["replay_rows"],
             "replay_total": state["replay_total"],
+            "replay_interval_seconds": state["replay_interval_seconds"],
             "evaluation": _evaluation_snapshot(),
         },
         "metrics": {
@@ -149,7 +225,7 @@ def _set_progress(processed: int, total: int) -> None:
         condition.notify_all()
 
 
-def _publish_batch(batch: list[dict[str, Any]]) -> None:
+def _publish_batch(batch: list[dict[str, Any]], duration_seconds: float) -> None:
     with condition:
         matrix = state["confusion_matrix"]
         for event in batch:
@@ -161,6 +237,12 @@ def _publish_batch(batch: list[dict[str, Any]]) -> None:
             state["counts"][category] += 1
             state["alert_count"] += int(is_alert)
             matrix[actual_category][category] += 1
+            for label, score in event["confidence_scores"].items():
+                histogram = state["roc_histogram"][label]
+                score_bin = min(ROC_BINS - 1, max(0, int(float(score) * ROC_BINS)))
+                histogram[
+                    "positive" if actual_category == label else "negative"
+                ][score_bin] += 1
             state["nodes"].update((event["source"], event["destination"]))
             if event["new_edge"]:
                 state["edge_count"] += 1
@@ -178,6 +260,7 @@ def _publish_batch(batch: list[dict[str, Any]]) -> None:
             event.pop("new_edge", None)
             state["events"].appendleft(event)
         state["version"] += 1
+        state["performance_samples"].append((len(batch), duration_seconds))
         condition.notify_all()
 
 
@@ -204,6 +287,13 @@ def _stream_worker() -> None:
                 )
                 for actual in summary["categories"]
             }
+            state["roc_histogram"] = {
+                category: {
+                    "positive": [0] * ROC_BINS,
+                    "negative": [0] * ROC_BINS,
+                }
+                for category in summary["categories"]
+            }
             state["replay_total"] = summary["replay_rows"]
             state["nodes"].update(model.active_nodes())
             state["edge_count"] = summary["edges"]
@@ -220,9 +310,10 @@ def _stream_worker() -> None:
                     lambda: not state["paused"]
                     or state["model_status"] in {"complete", "error"}
                 )
-                condition.wait(timeout=REPLAY_INTERVAL_SECONDS)
+                condition.wait(timeout=state["replay_interval_seconds"])
                 if state["paused"]:
                     continue
+            batch_started = perf_counter()
             batch = next(predictions, None)
             if batch is None:
                 with condition:
@@ -231,7 +322,7 @@ def _stream_worker() -> None:
                     state["version"] += 1
                     condition.notify_all()
                 return
-            _publish_batch(batch)
+            _publish_batch(batch, perf_counter() - batch_started)
     except Exception as error:
         logger.exception("Dataset GNN worker failed")
         with condition:
@@ -303,18 +394,82 @@ def stream_state() -> Response:
 @app.post("/api/control")
 def control_stream() -> Any:
     body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return jsonify({"error": "Request body phải là JSON object."}), 400
     action = body.get("action")
-    if action not in {"pause", "resume"}:
-        return jsonify({"error": "action phải là 'pause' hoặc 'resume'."}), 400
+    if action not in {"pause", "resume", "speed"}:
+        return jsonify({"error": "action phải là 'pause', 'resume' hoặc 'speed'."}), 400
+
+    if action == "speed":
+        interval = body.get("interval_seconds")
+        if (
+            isinstance(interval, bool)
+            or not isinstance(interval, (int, float))
+            or not math.isfinite(interval)
+            or not 0.01 <= interval <= 10
+        ):
+            return jsonify(
+                {"error": "interval_seconds phải nằm trong khoảng 0.01 đến 10."}
+            ), 400
 
     _start_worker()
     with condition:
-        if state["model_status"] in {"complete", "error"} and action == "resume":
+        if state["model_status"] in {"complete", "error"} and action != "pause":
             return jsonify({"error": "Dataset replay đã kết thúc hoặc gặp lỗi."}), 409
-        state["paused"] = action == "pause"
+        if action == "speed":
+            state["replay_interval_seconds"] = float(interval)
+        else:
+            state["paused"] = action == "pause"
         state["version"] += 1
         condition.notify_all()
-        return jsonify({"paused": state["paused"], "version": state["version"]})
+        return jsonify(
+            {
+                "paused": state["paused"],
+                "interval_seconds": state["replay_interval_seconds"],
+                "version": state["version"],
+            }
+        )
+
+
+@app.get("/api/neighbors")
+def inspect_neighbors() -> Any:
+    node = request.args.get("node", "").strip()
+    try:
+        hops = int(request.args.get("hops", "2"))
+    except ValueError:
+        return jsonify({"error": "hops phải là số nguyên từ 1 đến 3."}), 400
+    if not node:
+        return jsonify({"error": "Cần truyền node."}), 400
+    if not 1 <= hops <= 3:
+        return jsonify({"error": "hops phải nằm trong khoảng 1 đến 3."}), 400
+
+    with condition:
+        adjacency: dict[str, set[str]] = {}
+        for event in state["events"]:
+            source, destination = event["source"], event["destination"]
+            adjacency.setdefault(source, set()).add(destination)
+            adjacency.setdefault(destination, set()).add(source)
+    if node not in adjacency:
+        return jsonify({"error": "Không tìm thấy node trong các flow replay gần đây."}), 404
+
+    seen = {node}
+    frontier = {node}
+    layers = []
+    for distance in range(1, hops + 1):
+        next_frontier = {
+            neighbor
+            for current in frontier
+            for neighbor in adjacency.get(current, ())
+            if neighbor not in seen
+        }
+        seen.update(next_frontier)
+        layers.append(
+            {"hop": distance, "nodes": sorted(next_frontier)}
+        )
+        frontier = next_frontier
+    return jsonify(
+        {"node": node, "hops": hops, "layers": layers, "scope": "last 100 replay flows"}
+    )
 
 
 if __name__ == "__main__":

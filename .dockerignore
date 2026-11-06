@@ -2,9 +2,11 @@ __pycache__/
 *.py[cod]
 *.csv
 *.parquet
+*.npz
 *.pt
 *.pth
 *.ckpt
+artifacts/
 DataSet/
 .env
 .env.*

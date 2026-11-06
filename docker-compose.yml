@@ -2,6 +2,7 @@ services:
   streaming-gnn-ids:
     build: .
     container_name: streaming-gnn-ids
+    init: true
     ports:
       - "5000:5000"
     environment:
@@ -13,6 +14,13 @@ services:
       REPLAY_INTERVAL_SECONDS: "0.25"
     volumes:
       - ../DataSet:/data:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/healthz', timeout=3)"]
