@@ -33,7 +33,7 @@ Demo phát hiện xâm nhập mạng đa lớp trên các file CSV CIC-IDS2017. 
     └── index.html          # Dashboard Tailwind CSS, Chart.js và JavaScript
 ```
 
-Đặt các file CSV vào `..\DataSet` (thư mục `DataSet` nằm cạnh thư mục project). Docker Compose mount thư mục này vào `/data`; backend đọc toàn bộ file CSV theo tên đã sắp xếp. Có thể đặt một file CSV riêng hoặc các file Parquet vào thư mục thay thế; detector tự nhận dạng định dạng và các cột flow.
+Docker Compose hiện mount `..\DataSet\data1` (thư mục `DataSet` nằm cạnh thư mục project) vào `/data`; backend đọc toàn bộ file CSV theo tên đã sắp xếp. Có thể đổi bind mount trong `docker-compose.yml` nếu muốn chọn thư mục dữ liệu khác. Với chạy local, đặt `DATASET_PATH` tới thư mục chứa CSV, ví dụ `C:\Data\HK1_2026_2027\BigData\DataSet\data1`. Detector cũng nhận một file CSV riêng hoặc thư mục Parquet và tự nhận dạng định dạng/các cột flow.
 
 ### Tạo temporal graph snapshots từ NF-UNSW-NB15 hoặc dataset tương đương
 
